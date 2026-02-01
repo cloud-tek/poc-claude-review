@@ -39,24 +39,61 @@ jobs:
           app-id: ${{ secrets.CLAUDE_CODE_ACTION_APP_ID }}
           private-key: ${{ secrets.CLAUDE_CODE_ACTION_PRIVATE_KEY }}
 
-      - name: Fetch Existing Review Comments
-        id: fetch-comments
+      # Create tmp directory for storing PR data
+      - name: Setup PR Data Directory
+        run: mkdir -p ./tmp
+
+      # Restore cached PR comments from previous runs
+      - name: Restore PR Comment Cache
+        uses: actions/cache/restore@v4
+        id: cache-restore
+        with:
+          path: ./tmp/pr-comments.json
+          key: pr-${{ inputs.pr_number }}-comments-${{ github.sha }}
+          restore-keys: |
+            pr-${{ inputs.pr_number }}-comments-
+
+      # Fetch current comments from GitHub API (source of truth)
+      - name: Fetch Current Review Comments
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          echo "Fetching existing review comments for PR #${{ inputs.pr_number }}..."
+          echo "Fetching review comments for PR #${{ inputs.pr_number }}..."
 
-          # Fetch all review comments (inline comments on code)
+          # Fetch all inline review comments created by bots
           gh api "/repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/comments" \
-            --jq '[.[] | select(.user.type == "Bot") | {id: .id, path: .path, line: .line, body: .body, user: .user.login}]' \
-            > /tmp/existing-comments.json || echo '[]' > /tmp/existing-comments.json
+            --jq '[.[] | select(.user.type == "Bot") | {
+              id: .id,
+              path: .path,
+              line: .line,
+              body: .body,
+              user: .user.login,
+              created_at: .created_at,
+              updated_at: .updated_at
+            }]' > ./tmp/github-comments.json || echo '[]' > ./tmp/github-comments.json
 
-          COMMENT_COUNT=$(jq 'length' /tmp/existing-comments.json)
-          echo "Found $COMMENT_COUNT existing bot review comment(s)"
+          # If cache was restored, merge with GitHub data (GitHub is source of truth)
+          if [ -f ./tmp/pr-comments.json ]; then
+            echo "Merging cached data with GitHub API data..."
+            jq -s '
+              (.[0] // []) as $github |
+              (.[1] // []) as $cache |
+              ($github | map({(.id|tostring): .}) | add // {}) as $github_map |
+              ($cache | map({(.id|tostring): .}) | add // {}) as $cache_map |
+              ($github_map + $cache_map | to_entries | map(.value))
+            ' ./tmp/github-comments.json ./tmp/pr-comments.json > ./tmp/merged-comments.json
+            mv ./tmp/merged-comments.json ./tmp/pr-comments.json
+          else
+            echo "No cache found, using GitHub API data only"
+            mv ./tmp/github-comments.json ./tmp/pr-comments.json
+          fi
+
+          COMMENT_COUNT=$(jq 'length' ./tmp/pr-comments.json)
+          echo "Total tracked comments: $COMMENT_COUNT"
 
           if [ $COMMENT_COUNT -gt 0 ]; then
-            echo "📝 Existing comments preview:"
-            jq -r '.[] | "  - \(.path):\(.line) by \(.user)"' /tmp/existing-comments.json | head -5
+            echo "📝 Comment summary:"
+            jq -r 'group_by(.path) | map({path: .[0].path, count: length}) | .[] | "  \(.path): \(.count) comment(s)"' ./tmp/pr-comments.json
           fi
 
       - name: Run Claude Code Review
@@ -72,29 +109,58 @@ jobs:
             PR NUMBER: ${{ inputs.pr_number }}
             BASE BRANCH: ${{ inputs.base_ref }}
 
-            EXISTING COMMENTS: A list of existing bot review comments is available at /tmp/existing-comments.json
-            This file contains inline comments from previous review iterations.
-            You MUST check this file and update existing comments instead of creating duplicates.
+            EXISTING PR COMMENTS:
+            A JSON file containing existing bot review comments is located at: ./tmp/pr-comments.json
 
+            This file contains inline comments from previous review iterations with the following structure:
+            [
+              {
+                "id": <comment_id>,
+                "path": "file/path.cs",
+                "line": <line_number>,
+                "body": "comment text",
+                "user": "bot-username",
+                "created_at": "timestamp",
+                "updated_at": "timestamp"
+              }
+            ]
+
+            IMPORTANT INSTRUCTIONS FOR HANDLING COMMENTS:
+
+            1. ALWAYS read ./tmp/pr-comments.json before posting ANY inline comments
+
+            2. For each piece of feedback you want to provide:
+               - Check if a comment already exists for that file and line number
+               - If EXISTS: Use mcp__github_comment__update_claude_comment with the comment ID to UPDATE it
+               - If NOT EXISTS: Use mcp__github_inline_comment__create_inline_comment to CREATE a new comment
+
+            3. After creating new comments, ADD them to ./tmp/pr-comments.json so subsequent operations can reference them
+
+            4. DO NOT create duplicate comments on the same file and line
+
+            5. When updating comments, preserve the comment ID but update the body with new findings
+
+            Now run the review:
             /dotnet-code-review
 
-            IMPORTANT: Use the GitHub MCP tools to post inline comments on specific lines.
-            For code-specific feedback:
-            - Check /tmp/existing-comments.json for existing comments on the same file and line
-            - If a comment exists, UPDATE it using the GitHub API PATCH endpoint
-            - If no comment exists, CREATE a new one using mcp__github_inline_comment__create_inline_comment
-
-            Do NOT post duplicate comments. Always update existing comments when possible.
           claude_args: |
             --max-turns 25
             --allowedTools "mcp__github,mcp__github__create_issue_comment,mcp__github_inline_comment,mcp__github_inline_comment__create_inline_comment,mcp__github_comment,mcp__github_comment__update_claude_comment,Bash,Read,Grep,Glob,Edit,Write"
             --model claude-sonnet-4-5-20250929
           show_full_output: true
 
+      # Save updated comment data to cache for next run
+      - name: Save PR Comment Cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ./tmp/pr-comments.json
+          key: pr-${{ inputs.pr_number }}-comments-${{ github.sha }}
+
       - name: Check for Critical Issues
         if: always()
         run: |
-          if [ ! -f /tmp/review-results.json ]; then
+          if [ ! -f ./tmp/review-results.json ]; then
             echo "⚠️  Review results file not found - Claude Code may have failed to complete"
             echo "Checking if Claude Code step failed..."
             if [ "${{ steps.claude-review.outcome }}" != "success" ]; then
@@ -106,12 +172,12 @@ jobs:
           fi
 
           echo "📋 Review Results:"
-          cat /tmp/review-results.json | jq '.'
+          cat ./tmp/review-results.json | jq '.'
 
-          CRITICAL=$(jq -r '.has_critical_issues' /tmp/review-results.json)
-          HIGH=$(jq -r '.has_high_priority_issues' /tmp/review-results.json)
-          CRITICAL_COUNT=$(jq -r '.critical_count' /tmp/review-results.json)
-          HIGH_COUNT=$(jq -r '.high_priority_count' /tmp/review-results.json)
+          CRITICAL=$(jq -r '.has_critical_issues' ./tmp/review-results.json)
+          HIGH=$(jq -r '.has_high_priority_issues' ./tmp/review-results.json)
+          CRITICAL_COUNT=$(jq -r '.critical_count' ./tmp/review-results.json)
+          HIGH_COUNT=$(jq -r '.high_priority_count' ./tmp/review-results.json)
 
           echo ""
           echo "📊 Issue Summary:"
@@ -135,52 +201,52 @@ jobs:
           exit 0
 
       - name: Generate Review Summary Comment
-        if: always() && hashFiles('/tmp/review-results.json') != ''
+        if: always() && hashFiles('./tmp/review-results.json') != ''
         run: |
           # Generate a markdown summary from the JSON results
-          cat > /tmp/review-summary.md << 'EOF'
+          cat > ./tmp/review-summary.md << 'EOF'
           ## 🤖 Claude Code Review Summary
 
           EOF
 
           # Add summary from JSON if available
-          if [ -f /tmp/review-results.json ]; then
-            SUMMARY=$(jq -r '.summary // "Review completed"' /tmp/review-results.json)
-            CRITICAL_COUNT=$(jq -r '.critical_count // 0' /tmp/review-results.json)
-            HIGH_COUNT=$(jq -r '.high_priority_count // 0' /tmp/review-results.json)
-            REC_COUNT=$(jq -r '.recommendation_count // 0' /tmp/review-results.json)
-            MINOR_COUNT=$(jq -r '.minor_count // 0' /tmp/review-results.json)
+          if [ -f ./tmp/review-results.json ]; then
+            SUMMARY=$(jq -r '.summary // "Review completed"' ./tmp/review-results.json)
+            CRITICAL_COUNT=$(jq -r '.critical_count // 0' ./tmp/review-results.json)
+            HIGH_COUNT=$(jq -r '.high_priority_count // 0' ./tmp/review-results.json)
+            REC_COUNT=$(jq -r '.recommendation_count // 0' ./tmp/review-results.json)
+            MINOR_COUNT=$(jq -r '.minor_count // 0' ./tmp/review-results.json)
 
-            echo "$SUMMARY" >> /tmp/review-summary.md
-            echo "" >> /tmp/review-summary.md
-            echo "### 📊 Issue Breakdown" >> /tmp/review-summary.md
-            echo "" >> /tmp/review-summary.md
-            echo "| Severity | Count |" >> /tmp/review-summary.md
-            echo "|----------|-------|" >> /tmp/review-summary.md
-            echo "| ❌ Critical | $CRITICAL_COUNT |" >> /tmp/review-summary.md
-            echo "| ⚠️ High Priority | $HIGH_COUNT |" >> /tmp/review-summary.md
-            echo "| 💡 Recommendations | $REC_COUNT |" >> /tmp/review-summary.md
-            echo "| 📝 Minor/Nitpicks | $MINOR_COUNT |" >> /tmp/review-summary.md
-            echo "" >> /tmp/review-summary.md
+            echo "$SUMMARY" >> ./tmp/review-summary.md
+            echo "" >> ./tmp/review-summary.md
+            echo "### 📊 Issue Breakdown" >> ./tmp/review-summary.md
+            echo "" >> ./tmp/review-summary.md
+            echo "| Severity | Count |" >> ./tmp/review-summary.md
+            echo "|----------|-------|" >> ./tmp/review-summary.md
+            echo "| ❌ Critical | $CRITICAL_COUNT |" >> ./tmp/review-summary.md
+            echo "| ⚠️ High Priority | $HIGH_COUNT |" >> ./tmp/review-summary.md
+            echo "| 💡 Recommendations | $REC_COUNT |" >> ./tmp/review-summary.md
+            echo "| 📝 Minor/Nitpicks | $MINOR_COUNT |" >> ./tmp/review-summary.md
+            echo "" >> ./tmp/review-summary.md
 
             if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
-              echo "**⚠️ This PR has blocking issues that must be addressed before merging.**" >> /tmp/review-summary.md
+              echo "**⚠️ This PR has blocking issues that must be addressed before merging.**" >> ./tmp/review-summary.md
             elif [ "$REC_COUNT" -gt 0 ] || [ "$MINOR_COUNT" -gt 0 ]; then
-              echo "**✅ No blocking issues found. Please review the recommendations above.**" >> /tmp/review-summary.md
+              echo "**✅ No blocking issues found. Please review the recommendations above.**" >> ./tmp/review-summary.md
             else
-              echo "**✅ LGTM - No issues found!**" >> /tmp/review-summary.md
+              echo "**✅ LGTM - No issues found!**" >> ./tmp/review-summary.md
             fi
 
-            echo "" >> /tmp/review-summary.md
-            echo "_Last updated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> /tmp/review-summary.md
+            echo "" >> ./tmp/review-summary.md
+            echo "_Last updated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> ./tmp/review-summary.md
           fi
 
       - name: Post/Update Summary Comment
-        if: always() && hashFiles('/tmp/review-summary.md') != ''
+        if: always() && hashFiles('./tmp/review-summary.md') != ''
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: claude-code-review-summary
-          path: /tmp/review-summary.md
+          path: ./tmp/review-summary.md
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
       - name: Upload Review Results
@@ -188,6 +254,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: code-review-results-pr-${{ inputs.pr_number }}
-          path: /tmp/review-results.json
+          path: |
+            ./tmp/review-results.json
+            ./tmp/pr-comments.json
           if-no-files-found: warn
           retention-days: 30
