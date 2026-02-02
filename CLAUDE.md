@@ -128,6 +128,8 @@ The workflow implements duplicate comment prevention using GitHub Actions cache:
     "id": "comment_id",
     "path": "file/path.cs",
     "line": 42,
+    "original_line": 42,
+    "position": 42,
     "body": "comment text",
     "user": "bot-username",
     "created_at": "2024-01-15T10:30:00Z",
@@ -135,6 +137,49 @@ The workflow implements duplicate comment prevention using GitHub Actions cache:
   }
 ]
 ```
+
+**Field Descriptions:**
+- `line`: Current line number in the PR diff (null if comment is outdated after code changes)
+- `original_line`: Original line number where comment was posted (preserved even when outdated)
+- `position`: Position in the diff (used by GitHub for rendering)
+
+### Handling Outdated Comments
+
+When code changes are pushed to a PR, GitHub marks inline comments as "outdated" if the lines they reference have changed:
+
+**Before code change:**
+```json
+{
+  "id": 12345,
+  "path": "src/Example.cs",
+  "line": 42,
+  "original_line": 42,
+  "body": "Fix this issue"
+}
+```
+
+**After code change (comment becomes outdated):**
+```json
+{
+  "id": 12345,
+  "path": "src/Example.cs",
+  "line": null,           // ❌ Set to null
+  "original_line": 42,    // ✅ Preserved
+  "body": "Fix this issue"
+}
+```
+
+**Comment Matching Strategy:**
+
+The workflow matches comments using this logic:
+1. **For current comments** (`line` is not null): Match on `path` + `line`
+2. **For outdated comments** (`line` is null): Match on `path` + `original_line`
+3. This prevents creating duplicate comments for issues that were already flagged
+
+**Why this matters:**
+- Multiple outdated comments on the same file all have `line: null`
+- Without `original_line`, they're indistinguishable
+- Using `original_line` allows proper deduplication even after code changes
 
 ### Cache Lifecycle Example
 

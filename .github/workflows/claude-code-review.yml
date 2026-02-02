@@ -66,6 +66,8 @@ jobs:
               id: .id,
               path: .path,
               line: .line,
+              original_line: .original_line,
+              position: .position,
               body: .body,
               user: .user.login,
               created_at: .created_at,
